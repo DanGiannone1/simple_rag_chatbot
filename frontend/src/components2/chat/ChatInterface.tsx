@@ -41,7 +41,7 @@ export function ChatInterface() {
           color: 'var(--text-bright)',
         }}
       >
-        AI Chat Assistant
+        Reminder Media Chatbot
       </Title>
 
       <ScrollArea 

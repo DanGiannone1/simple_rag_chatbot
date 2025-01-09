@@ -7,7 +7,9 @@ import os
 from dotenv import load_dotenv
 from flask_cors import CORS
 import json
-from document_processor import DocumentProcessor
+import re
+
+from document_processor import get_context
 
 # Load environment variables
 load_dotenv()
@@ -18,12 +20,8 @@ CORS(app)  # Enable CORS for all routes
 # Initialize Gemini with API key
 genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
 
-# Initialize the model and document processor
-model = genai.GenerativeModel('gemini-pro')
-doc_processor = DocumentProcessor(
-    source_dir="../data/source_files",
-    db_dir="../data/vector_db"
-)
+# Initialize the model
+model = genai.GenerativeModel('gemini-2.0-flash-exp')
 
 # Serve static files
 @app.route('/')
@@ -34,211 +32,166 @@ def serve_index():
 def serve_static(path):
     return send_from_directory(app.static_folder, path)
 
-@app.route('/process-docs', methods=['POST'])
-def process_documents():
-    """Endpoint to process/reprocess all documents"""
-    try:
-        overwrite = request.json.get('overwrite', False) if request.json else False
-        doc_processor.process_pdfs(overwrite=overwrite)
-        return jsonify({'message': 'Documents processed successfully'})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+# ------------------------------------------------------------------------------------
+# Optional: Remove or comment out the /process-docs endpoint if it's no longer needed
+# ------------------------------------------------------------------------------------
+# @app.route('/process-docs', methods=['POST'])
+# def process_documents():
+#     # No longer needed
+#     return jsonify({'message': 'Not used anymore'})
 
-#API route for chat
+def extract_references(text: str):
+    """
+    Look for a pattern like:
+      [REFERENCES: { "files": ["some_file.pdf", "some_file.txt"] }]
+    Return a list of citation objects with shape:
+      [{ "id": 1, "source": "some_file.pdf", "page": null, "content": "" }, ... ]
+    """
+    pattern = r'\[REFERENCES:\s*(\{.*?\})\s*\]'
+    match = re.search(pattern, text, re.DOTALL)
+    if match:
+        try:
+            references_str = match.group(1)
+            references_data = json.loads(references_str)
+            file_names = references_data.get('files', [])
+            # Convert file names into an array of citation dicts
+            citations = []
+            for idx, f in enumerate(file_names, start=1):
+                citations.append({
+                    'id': idx,
+                    'source': f,
+                    'page': None,
+                    'content': ''
+                })
+            return citations
+        except Exception as e:
+            print(f"Error parsing references: {e}")
+            return []
+    return []
+
 @app.route('/chat', methods=['POST'])
 def chat():
     try:
         data = request.json
         user_message = data.get('message')
         print(f"\nUser message: {user_message}")
-        
+
         if not user_message:
             return jsonify({'error': 'No message provided'}), 400
 
-        # Get relevant document chunks
-        relevant_docs = doc_processor.query_similar(user_message)
-        
-        # Print chunks for debugging
-        print("\nRelevant chunks found:")
-        for i, doc in enumerate(relevant_docs, 1):
-            print(f"\n[{i}] From {doc['source']}, Page {doc['page']}:")
-            print("-" * 50)
-            print(doc['content'])
-            print("-" * 50)
-        
-        # Format context with citations
-        context_parts = []
-        citations = []  # Store citations for frontend
-        for i, doc in enumerate(relevant_docs, 1):
-            context_parts.append(f"[{i}] From {doc['source']}, Page {doc['page']}:\n{doc['content']}")
-            citations.append({
-                'id': i,
-                'source': doc['source'],
-                'page': doc['page'],
-                'content': doc['content']
-            })
-        context = "\n\n".join(context_parts)
-        
+        # Read all files from the data folder
+        context = get_context()
+
+        print("\nFinal context being passed to model:")
+        print("=" * 80)
+        print(context)
+        print("=" * 80)
+
         def generate():
-            # Generate streaming response using Gemini
-            prompt = f"""Please provide a response using the following context and format it using markdown syntax where appropriate. If the context doesn't help answer the question, just respond based on your general knowledge.
+            """
+            Stream the response from the model as server-sent events (SSE).
+            We accumulate the text so we can parse out the references JSON block at the end.
+            """
+            prompt = f"""You are a helpful assistant that provides information based on the given context. Say "I'm sorry I can't help with that" if the answer isn't found in the context. 
 
-When you use information from the context, please cite the source using the number in brackets [1], [2], etc.
+            The context is provided with XML-style tags indicating the source file. For example:
+            <example.txt>
+            This is the content of example.txt
+            </example.txt>
 
-Context:
-{context}
+            Cite your sources by [1], [2], [3], etc. At the end of your response, include a references section in this exact format:
 
-User Question:
-{user_message}
+            References:
+            [REFERENCES: {{ "files": ["source1.txt", "source2.pdf"] }}]
 
-Please provide a well-structured response with appropriate citations."""
+            Do not include any other text or formatting in your response besides:
+            1. Your answer with citations
+            2. The word "References:" on a new line
+            3. The [REFERENCES] JSON block
+            4. IMPORTANT: Only include files in the references that were actually used in the answer. Cite a source as [1] even if it was the third source you looked at. 
+
+            Context:
+            {context}
+
+            User Question:
+            {user_message}"""
 
             response = model.generate_content(prompt, stream=True)
-            
-            # Send citations first
-            yield f"data: {json.dumps({'citations': citations})}\n\n"
-            
+
+            accumulated_text = ""
             for chunk in response:
                 if chunk.text:
-                    # Format the data as SSE
-                    data = json.dumps({'chunk': chunk.text})
-                    yield f"data: {data}\n\n"
-            
-            # Send a completion message
+                    # Clean up any extra newlines or spaces around the references block
+                    text = chunk.text
+                    accumulated_text += text
+                    data_chunk = json.dumps({'chunk': text})
+                    yield f"data: {data_chunk}\n\n"
+
+            # Once the stream ends, parse out the references
+            references = extract_references(accumulated_text)
+            if references:
+                data_citations = json.dumps({'citations': references})
+                yield f"data: {data_citations}\n\n"
+
+            # Signal end of SSE
             yield "data: [DONE]\n\n"
 
         return Response(generate(), mimetype='text/event-stream')
-    
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=True)
+
 --------------------------------------------------------------------------------
 <File: backend/document_processor.py>
-from langchain.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain.vectorstores import Chroma
 import os
-import shutil
-from dotenv import load_dotenv
-import argparse
+from langchain.document_loaders import PyPDFLoader
+import pypdf
 
-load_dotenv()
+def get_context():
+    """
+    Reads all files in ../data/source_files.
+    If a file is PDF, we extract its text using PyPDFLoader.
+    Otherwise, we read it as plain text.
+    Returns a single string with the contents of all files, each prefixed with its filename.
+    """
+    directory = "../data/source_files"
+    all_text = []
 
-class DocumentProcessor:
-    def __init__(self, source_dir="../data/source_files", db_dir="../data/vector_db"):
-        self.source_dir = source_dir
-        self.db_dir = db_dir
-        self.embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/embedding-001",
-            google_api_key=os.getenv("GOOGLE_API_KEY")
-        )
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            length_function=len,
-        )
-        
-    def clear_database(self):
-        """Clear all data from the vector database."""
-        if os.path.exists(self.db_dir):
-            print(f"Clearing existing database at {self.db_dir}")
-            shutil.rmtree(self.db_dir)
-            os.makedirs(self.db_dir)
-            print("Database cleared successfully")
-        
-    def process_pdfs(self, overwrite=False):
-        """Process all PDFs in the source directory and store them in the vector database.
-        
-        Args:
-            overwrite (bool): If True, clear existing database before processing.
-        """
-        if overwrite:
-            self.clear_database()
-            
-        documents = []
-        
-        # Load all PDFs from the source directory
-        pdf_files = [f for f in os.listdir(self.source_dir) if f.endswith(".pdf")]
-        if not pdf_files:
-            print(f"No PDF files found in {self.source_dir}")
-            return None
-            
-        print(f"Found {len(pdf_files)} PDF files to process...")
-        
-        for filename in pdf_files:
-            file_path = os.path.join(self.source_dir, filename)
-            print(f"Processing {filename}...")
-            loader = PyPDFLoader(file_path)
-            # PyPDFLoader automatically includes page numbers in metadata
-            docs = loader.load()
-            # Add source filename to metadata
-            for doc in docs:
-                doc.metadata["source"] = filename
-            documents.extend(docs)
-        
-        print("Splitting documents into chunks...")
-        # Split documents into chunks while preserving metadata
-        texts = self.text_splitter.split_documents(documents)
-        
-        print("Creating vector store...")
-        # Create or load the vector store
-        db = Chroma.from_documents(
-            documents=texts,
-            embedding=self.embeddings,
-            persist_directory=self.db_dir
-        )
-        db.persist()
-        print(f"Successfully processed {len(pdf_files)} files and created {len(texts)} chunks")
-        return db
-    
-    def query_similar(self, query: str, k: int = 3):
-        """Query the vector store for similar chunks of text."""
-        db = Chroma(
-            persist_directory=self.db_dir,
-            embedding_function=self.embeddings
-        )
-        results = db.similarity_search(query, k=k)
-        # Format results with metadata
-        formatted_results = []
-        for doc in results:
-            formatted_results.append({
-                'content': doc.page_content,
-                'source': doc.metadata.get('source', 'Unknown'),
-                'page': doc.metadata.get('page', 1)
-            })
-        return formatted_results
+    if not os.path.exists(directory):
+        print(f"Warning: Directory {directory} does not exist.")
+        return ""
 
-def main():
-    parser = argparse.ArgumentParser(description='Process PDF documents for RAG system')
-    parser.add_argument('--source-dir', type=str, default='../data/source_files',
-                      help='Directory containing PDF files (default: ../data/source_files)')
-    parser.add_argument('--db-dir', type=str, default='../data/vector_db',
-                      help='Directory to store vector database (default: ../data/vector_db)')
-    parser.add_argument('--test-query', type=str,
-                      help='Optional test query to try after processing')
-    parser.add_argument('--overwrite', action='store_true',
-                      help='Overwrite existing database instead of updating it')
-    
-    args = parser.parse_args()
-    
-    processor = DocumentProcessor(source_dir=args.source_dir, db_dir=args.db_dir)
-    
-    print("Starting document processing...")
-    processor.process_pdfs(overwrite=args.overwrite)
-    
-    if args.test_query:
-        print(f"\nTesting with query: {args.test_query}")
-        results = processor.query_similar(args.test_query)
-        print("\nTop relevant chunks:")
-        for i, doc in enumerate(results, 1):
-            print(f"\n--- Chunk {i} from {doc['source']}, Page {doc['page']} ---")
-            print(doc['content'][:200] + "..." if len(doc['content']) > 200 else doc['content'])
+    for filename in os.listdir(directory):
+        file_path = os.path.join(directory, filename)
 
-if __name__ == "__main__":
-    main() 
+        if not os.path.isfile(file_path):
+            continue
+
+        # If it's a PDF, extract the text
+        if filename.lower().endswith(".pdf"):
+            try:
+                loader = PyPDFLoader(file_path)
+                docs = loader.load()  # Each doc represents one page
+                pdf_content = []
+                for i, doc in enumerate(docs, 1):
+                    pdf_content.append(f"[Page {i}]: {doc.page_content}")
+                all_text.append(f"<{filename}>\n" + "\n".join(pdf_content) + "\n</{filename}>")
+            except Exception as e:
+                print(f"Error reading PDF {filename}: {e}")
+        else:
+            # Otherwise, treat it as a plain text file
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    all_text.append(f"<{filename}>\n{content}\n</{filename}>")
+            except Exception as e:
+                print(f"Error reading file {filename}: {e}")
+
+    return "\n\n".join(all_text)
+
 --------------------------------------------------------------------------------
 <File: backend/requirements.txt>
 flask
@@ -247,7 +200,6 @@ google-generativeai
 flask-cors
 pypdf
 langchain
-chromadb
 tiktoken
 langchain-community
 langchain-google-genai
@@ -272,10 +224,13 @@ langchain-google-genai
     "@mantine/hooks": "^7.15.2",
     "@tabler/icons-react": "^3.26.0",
     "@types/react-syntax-highlighter": "^15.5.13",
+    "@types/uuid": "^10.0.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^8.0.7",
-    "react-syntax-highlighter": "^15.6.1"
+    "react-syntax-highlighter": "^15.6.1",
+    "remark-gfm": "^4.0.0",
+    "uuid": "^11.0.3"
   },
   "devDependencies": {
     "@eslint/js": "^9.17.0",
@@ -393,7 +348,7 @@ export default tseslint.config({
 --------------------------------------------------------------------------------
 <File: frontend/src/App.tsx>
 import { MantineProvider, AppShell, Container } from '@mantine/core';
-import ChatInterface from './components/chat/ui/ChatInterface';
+import { ChatInterface } from './components2/chat/ChatInterface';
 import '@mantine/core/styles.css';
 
 function App() {
@@ -424,219 +379,26 @@ function App() {
 export default App;
 
 --------------------------------------------------------------------------------
-<File: frontend/src/components/chat/hooks/useChat.ts>
-import { useState } from 'react';
-import { Message } from '../types';
-
-export const useChat = () => {
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [input, setInput] = useState('');
-  const [isTyping, setIsTyping] = useState(false);
-
-  const handleSend = async () => {
-    if (!input.trim() || isTyping) return;
-
-    const userMessage: Message = {
-      text: input,
-      isBot: false,
-      timestamp: new Date(),
-    };
-
-    setMessages(prev => [...prev, userMessage]);
-    setInput('');
-    setIsTyping(true);
-
-    try {
-      const tempBotMessage: Message = {
-        text: '',
-        isBot: true,
-        timestamp: new Date(),
-      };
-      setMessages(prev => [...prev, tempBotMessage]);
-
-      const response = await fetch('/chat', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ message: input }),
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to get response');
-      }
-
-      const reader = response.body?.getReader();
-      const decoder = new TextDecoder();
-
-      if (!reader) {
-        throw new Error('Failed to initialize stream reader');
-      }
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        const chunk = decoder.decode(value);
-        const lines = chunk.split('\n');
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6);
-            if (data === '[DONE]') {
-              console.log('Stream completed. Final message:', messages[messages.length - 1]);
-              break;
-            }
-
-            try {
-              const parsedData = JSON.parse(data);
-              console.log('Received data:', parsedData);
-              
-              setMessages(prev => {
-                const newMessages = [...prev];
-                const lastMessage = newMessages[newMessages.length - 1];
-                if (lastMessage.isBot) {
-                  if (parsedData.citations) {
-                    console.log('Adding citations:', parsedData.citations);
-                    lastMessage.citations = parsedData.citations;
-                  } else if (parsedData.chunk) {
-                    console.log('Adding chunk:', parsedData.chunk);
-                    lastMessage.text += parsedData.chunk;
-                  }
-                  console.log('Updated message:', lastMessage);
-                }
-                return newMessages;
-              });
-            } catch (e) {
-              console.error('Failed to parse chunk:', e);
-            }
-          }
-        }
-      }
-
-    } catch (error) {
-      console.error('Chat error:', error);
-      const errorMessage: Message = {
-        text: `Error: ${error instanceof Error ? error.message : 'Failed to get response'}`,
-        isBot: true,
-        timestamp: new Date(),
-      };
-      setMessages(prev => [...prev, errorMessage]);
-    } finally {
-      setIsTyping(false);
-    }
-  };
-
-  return {
-    messages,
-    input,
-    isTyping,
-    setInput,
-    handleSend,
-  };
-}; 
---------------------------------------------------------------------------------
-<File: frontend/src/components/chat/types/index.ts>
-export interface Message {
-  text: string;
-  isBot: boolean;
-  timestamp: Date;
-  citations?: Citation[];
-}
-
-export interface Citation {
-  id: number;
-  source: string;
-  page: number;
-  content: string;
-} 
---------------------------------------------------------------------------------
-<File: frontend/src/components/chat/ui/ChatInput.tsx>
-import { Box, TextInput, Group, ActionIcon, Paper } from '@mantine/core';
+<File: frontend/src/components2/chat/ChatInterface.tsx>
+import { Stack, TextInput, ActionIcon, Paper, ScrollArea, Title } from '@mantine/core';
 import { IconSend } from '@tabler/icons-react';
+import { useState,  } from 'react';
+import { useChat } from './hooks/useChat';
+import { MessageBubble } from './ui/MessageBubble';
+import { EmptyState } from './ui/EmptyState';
 
-interface ChatInputProps {
-  input: string;
-  isTyping: boolean;
-  onInputChange: (value: string) => void;
-  onSend: () => void;
-}
+export function ChatInterface() {
+  const { messages, isStreaming, sendMessage } = useChat();
+  const [input, setInput] = useState('');
 
-export function ChatInput({ input, isTyping, onInputChange, onSend }: ChatInputProps) {
-  return (
-    <Paper
-      p="md"
-      radius={0}
-      style={{
-        borderTop: '1px solid var(--border-color)',
-        backgroundColor: 'var(--input-bg)',
-        position: 'relative',
-      }}
-    >
-      <Box style={{ maxWidth: '1200px', margin: '0 auto' }}>
-        <Group gap={8} align="center" style={{ position: 'relative' }}>
-          <TextInput
-            placeholder="Type your message..."
-            value={input}
-            onChange={(e) => onInputChange(e.target.value)}
-            onKeyPress={(e) => e.key === 'Enter' && onSend()}
-            size="lg"
-            radius="xl"
-            disabled={isTyping}
-            style={{ flex: 1 }}
-            styles={{
-              input: {
-                backgroundColor: 'var(--container-bg)',
-                border: '1px solid var(--border-color)',
-                '&:focus': {
-                  borderColor: 'var(--mantine-color-blue-filled)',
-                },
-                fontSize: '1rem',
-                padding: '1.2rem',
-                height: 'auto',
-                paddingRight: '3.5rem',
-                color: 'var(--text-bright)',
-                '&::placeholder': {
-                  color: 'var(--text-secondary)',
-                }
-              }
-            }}
-          />
-          <ActionIcon
-            size="lg"
-            radius="xl"
-            color="blue"
-            variant="subtle"
-            onClick={onSend}
-            disabled={isTyping}
-            style={{ 
-              position: 'absolute',
-              right: '0.5rem',
-              backgroundColor: input.trim() ? 'var(--mantine-color-blue-filled)' : 'transparent',
-              color: input.trim() ? 'white' : 'var(--mantine-color-blue-filled)',
-              transition: 'all 0.2s ease',
-              '&:hover': {
-                backgroundColor: input.trim() ? 'var(--mantine-color-blue-filled-hover)' : 'var(--mantine-color-blue-light)',
-              }
-            }}
-          >
-            <IconSend size="1.2rem" />
-          </ActionIcon>
-        </Group>
-      </Box>
-    </Paper>
-  );
-} 
---------------------------------------------------------------------------------
-<File: frontend/src/components/chat/ui/ChatInterface.tsx>
-import { Paper, ScrollArea, Stack, Title } from '@mantine/core';
-import { useChat } from '../hooks/useChat';
-import { EmptyState } from './EmptyState';
-import { MessageBubble } from './MessageBubble';
-import { ChatInput } from './ChatInput';
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!input.trim() || isStreaming) return;
 
-export default function ChatInterface() {
-  const { messages, input, isTyping, setInput, handleSend } = useChat();
+    const message = input.trim();
+    setInput('');
+    await sendMessage(message);
+  };
 
   return (
     <Paper
@@ -661,7 +423,7 @@ export default function ChatInterface() {
           color: 'var(--text-bright)',
         }}
       >
-        AI Chat Assistant
+        Reminder Media Chatbot
       </Title>
 
       <ScrollArea 
@@ -675,74 +437,218 @@ export default function ChatInterface() {
           {messages.length === 0 ? (
             <EmptyState />
           ) : (
-            <>
-              {messages.map((message, index) => (
-                <MessageBubble key={index} message={message} />
-              ))}
-            </>
+            messages.map(message => (
+              <MessageBubble 
+                key={message.id} 
+                message={message} 
+              />
+            ))
           )}
         </Stack>
       </ScrollArea>
 
-      <ChatInput
-        input={input}
-        isTyping={isTyping}
-        onInputChange={setInput}
-        onSend={handleSend}
-      />
+      <Paper 
+        p="md" 
+        style={{ 
+          borderTop: '1px solid var(--border-color)',
+          backgroundColor: 'var(--input-bg)',
+        }}
+      >
+        <form onSubmit={handleSubmit}>
+          <TextInput
+            placeholder="Type your message..."
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            disabled={isStreaming}
+            size="lg"
+            radius="xl"
+            styles={{
+              input: {
+                backgroundColor: 'var(--container-bg)',
+                border: '1px solid var(--border-color)',
+                '&:focus': {
+                  borderColor: 'var(--mantine-color-blue-filled)',
+                },
+                fontSize: '1rem',
+                padding: '1.2rem',
+                height: 'auto',
+                paddingRight: '3.5rem',
+                color: 'var(--text-bright)',
+                '&::placeholder': {
+                  color: 'var(--text-secondary)',
+                }
+              }
+            }}
+            rightSection={
+              <ActionIcon 
+                size="lg"
+                radius="xl"
+                color="blue"
+                variant="subtle"
+                type="submit"
+                disabled={!input.trim() || isStreaming}
+                style={{ 
+                  backgroundColor: input.trim() ? 'var(--mantine-color-blue-filled)' : 'transparent',
+                  color: input.trim() ? 'white' : 'var(--mantine-color-blue-filled)',
+                  transition: 'all 0.2s ease',
+                  '&:hover': {
+                    backgroundColor: input.trim() ? 'var(--mantine-color-blue-filled-hover)' : 'var(--mantine-color-blue-light)',
+                  }
+                }}
+              >
+                <IconSend style={{ width: '1.2rem', height: '1.2rem' }} />
+              </ActionIcon>
+            }
+          />
+        </form>
+      </Paper>
     </Paper>
   );
 } 
 --------------------------------------------------------------------------------
-<File: frontend/src/components/chat/ui/CitationSidebar.tsx>
-import { Paper, Text, Stack, ScrollArea, Title, Group } from '@mantine/core';
-import { Citation } from '../types';
+<File: frontend/src/components2/chat/hooks/useChat.ts>
+import { useState, useCallback } from 'react';
+import { Message, StreamChunk, Citation } from '../types';
+import { v4 as uuidv4 } from 'uuid';
 
-interface CitationSidebarProps {
-  citation: Citation | null;
+export function useChat() {
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [currentStreamId, setCurrentStreamId] = useState<string | null>(null);
+
+  const handleStream = useCallback(async (userMessage: string) => {
+    if (isStreaming) return;
+
+    // Add user message
+    const userMessageObj: Message = {
+      id: uuidv4(),
+      text: userMessage,
+      isBot: false,
+      timestamp: new Date(),
+    };
+    setMessages(prev => [...prev, userMessageObj]);
+
+    // Create placeholder for bot message
+    const botMessageId = uuidv4();
+    const botMessage: Message = {
+      id: botMessageId,
+      text: '',
+      isBot: true,
+      timestamp: new Date(),
+      isComplete: false,
+    };
+    setMessages(prev => [...prev, botMessage]);
+    setCurrentStreamId(botMessageId);
+    setIsStreaming(true);
+
+    try {
+      const response = await fetch('/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: userMessage }),
+      });
+
+      if (!response.ok) throw new Error('Failed to get response');
+
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error('No reader available');
+
+      let citations: Citation[] = [];
+      let accumulatedText = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        // Process the chunks
+        const chunk = new TextDecoder().decode(value);
+        const lines = chunk.split('\n');
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          if (line.includes('[DONE]')) {
+            setMessages(prev => prev.map(msg => 
+              msg.id === botMessageId ? { ...msg, isComplete: true } : msg
+            ));
+            setIsStreaming(false);
+            setCurrentStreamId(null);
+            break;
+          }
+
+          try {
+            const data: StreamChunk = JSON.parse(line.slice(5));
+            
+            if (data.citations) {
+              citations = data.citations;
+              setMessages(prev => prev.map(msg => 
+                msg.id === botMessageId ? { ...msg, citations } : msg
+              ));
+            }
+
+            if (data.chunk) {
+              accumulatedText += data.chunk;
+              setMessages(prev => prev.map(msg => 
+                msg.id === botMessageId ? { ...msg, text: accumulatedText } : msg
+              ));
+            }
+          } catch (e) {
+            console.error('Failed to parse chunk:', e);
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Chat error:', error);
+      setMessages(prev => prev.map(msg => 
+        msg.id === botMessageId ? { 
+          ...msg, 
+          text: 'Error: Failed to get response', 
+          isComplete: true 
+        } : msg
+      ));
+    } finally {
+      setIsStreaming(false);
+      setCurrentStreamId(null);
+    }
+  }, [isStreaming]);
+
+  return {
+    messages,
+    isStreaming,
+    currentStreamId,
+    sendMessage: handleStream,
+  };
+} 
+--------------------------------------------------------------------------------
+<File: frontend/src/components2/chat/types.ts>
+export interface Citation {
+  id: number;
+  source: string;
+  page: number;
+  content: string;
 }
 
-export function CitationSidebar({ citation }: CitationSidebarProps) {
-  if (!citation) return null;
+export interface Message {
+  id: string;
+  text: string;
+  isBot: boolean;
+  timestamp: Date;
+  citations?: Citation[];
+  isComplete?: boolean;  // Indicates if streaming is complete
+}
 
-  return (
-    <Paper
-      p="md"
-      style={{
-        width: '400px',
-        height: '100%',
-        backgroundColor: 'var(--container-bg)',
-        borderLeft: '1px solid var(--border-color)',
-      }}
-    >
-      <Stack h="100%">
-        <Title order={3} style={{ color: 'var(--text-bright)' }}>Citation Details</Title>
-        <Group justify="space-between" align="center">
-          <Text fw={500} size="sm" style={{ color: 'var(--text-bright)' }}>
-            Source: {citation.source}
-          </Text>
-          <Text size="xs" c="dimmed">Page {citation.page}</Text>
-        </Group>
-        <ScrollArea flex={1}>
-          <Paper 
-            withBorder 
-            p="md" 
-            style={{ 
-              backgroundColor: 'var(--message-bot-bg)',
-              color: 'var(--text-bright)',
-            }}
-          >
-            <Text size="sm" style={{ whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>
-              {citation.content}
-            </Text>
-          </Paper>
-        </ScrollArea>
-      </Stack>
-    </Paper>
-  );
+export interface StreamChunk {
+  citations?: Citation[];
+  chunk?: string;
+}
+
+// State for managing message streaming
+export interface MessageStreamState {
+  isStreaming: boolean;
+  accumulatedText: string;
+  citations: Citation[];
 } 
 --------------------------------------------------------------------------------
-<File: frontend/src/components/chat/ui/EmptyState.tsx>
+<File: frontend/src/components2/chat/ui/EmptyState.tsx>
 import { Box, Text } from '@mantine/core';
 import { IconRobot } from '@tabler/icons-react';
 
@@ -762,258 +668,261 @@ export function EmptyState() {
   );
 } 
 --------------------------------------------------------------------------------
-<File: frontend/src/components/chat/ui/MarkdownComponents.tsx>
-import { Box, Text, Title } from '@mantine/core';
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
-import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import { Message, Citation } from '../types';
-
-interface MarkdownComponentsProps {
-  message: Message;
-  onCitationClick: (citation: Citation) => void;
-}
-
-export const createMarkdownComponents = ({ message, onCitationClick }: MarkdownComponentsProps) => ({
-  code: ({inline, className, children}: {inline?: boolean, className?: string, children: React.ReactNode}) => {
-    const match = /language-(\w+)/.exec(className || '');
-    return !inline && match ? (
-      <SyntaxHighlighter
-        style={oneDark}
-        language={match[1]}
-        customStyle={{
-          margin: '0.5rem 0',
-          borderRadius: '4px',
-        }}
-      >
-        {String(children).replace(/\n$/, '')}
-      </SyntaxHighlighter>
-    ) : (
-      <code 
-        className={className}
-        style={{
-          backgroundColor: 'var(--container-bg)',
-          padding: '0.2rem 0.4rem',
-          borderRadius: '4px',
-          fontSize: '0.9em',
-        }}
-      >
-        {children}
-      </code>
-    );
-  },
-
-  text: ({children}: {children: React.ReactNode}) => {
-    if (typeof children !== 'string') return <>{children}</>;
-    
-    const parts = children.split(/(\[\d+\])/g);
-    console.log('Split text into parts:', parts);
-    
-    return (
-      <span style={{ color: 'var(--text-bright)' }}>
-        {parts.map((part, index) => {
-          const citationMatch = part.match(/\[(\d+)\]/);
-          if (!citationMatch) return part;
-          
-          const citationId = parseInt(citationMatch[1]);
-          console.log('Found citation:', citationId);
-          const citation = message.citations?.find(c => c.id === citationId);
-          console.log('Matching citation object:', citation);
-          
-          if (!citation) return part;
-          
-          return (
-            <Text 
-              key={index}
-              component="span" 
-              c="blue.5"
-              style={{ 
-                cursor: 'pointer', 
-                textDecoration: 'underline',
-                display: 'inline-block'
-              }}
-              onClick={() => {
-                console.log('Citation clicked:', citation);
-                onCitationClick(citation);
-              }}
-            >
-              {part}
-            </Text>
-          );
-        })}
-      </span>
-    );
-  },
-
-  p: ({children}: {children: React.ReactNode}) => (
-    <Text 
-      size="sm" 
-      style={{ 
-        margin: '0.5rem 0',
-        lineHeight: 1.6,
-        color: 'var(--text-bright)',
-      }}
-    >
-      {children}
-    </Text>
-  ),
-
-  h1: ({children}: {children: React.ReactNode}) => (
-    <Title order={1} style={{ margin: '1rem 0 0.5rem', fontSize: '1.5rem', color: 'var(--text-bright)' }}>
-      {children}
-    </Title>
-  ),
-
-  h2: ({children}: {children: React.ReactNode}) => (
-    <Title order={2} style={{ margin: '1rem 0 0.5rem', fontSize: '1.3rem', color: 'var(--text-bright)' }}>
-      {children}
-    </Title>
-  ),
-
-  ul: ({children}: {children: React.ReactNode}) => (
-    <Box component="ul" style={{ margin: '0.5rem 0', paddingLeft: '1.5rem' }}>
-      {children}
-    </Box>
-  ),
-
-  li: ({children}: {children: React.ReactNode}) => (
-    <Box 
-      component="li" 
-      style={{ 
-        margin: '0.25rem 0',
-        color: 'var(--text-bright)',
-        fontSize: '0.875rem',
-        lineHeight: 1.6,
-      }}
-    >
-      {children}
-    </Box>
-  ),
-}); 
---------------------------------------------------------------------------------
-<File: frontend/src/components/chat/ui/MessageBubble.tsx>
-import { Paper, Text, ActionIcon, Group } from '@mantine/core';
+<File: frontend/src/components2/chat/ui/MessageBubble.tsx>
+import { Paper, Group, Text, Stack } from '@mantine/core';
 import { IconRobot, IconUser } from '@tabler/icons-react';
-import ReactMarkdown from 'react-markdown';
-import { Message, Citation } from '../types';
-import { createMarkdownComponents } from './MarkdownComponents';
-import { CitationSidebar } from './CitationSidebar';
-import { useState } from 'react';
+import { Message } from '../types';
+import { MessageContent } from './MessageContent';
 
 interface MessageBubbleProps {
   message: Message;
 }
 
 export function MessageBubble({ message }: MessageBubbleProps) {
-  const [selectedCitation, setSelectedCitation] = useState<Citation | null>(null);
+  const isBot = message.isBot;
 
   return (
-    <Group wrap="nowrap" gap="sm" align="flex-start" style={{ width: '100%' }}>
-      <Group
-        wrap="nowrap"
-        gap="sm"
-        justify={message.isBot ? 'flex-start' : 'flex-end'}
-        align="flex-start"
-        style={{ flex: 1 }}
+    <Stack 
+      gap={4}
+      align={isBot ? "flex-start" : "flex-end"}
+      style={{ 
+        padding: '0.5rem 1rem',
+        maxWidth: '85%',
+        alignSelf: isBot ? 'flex-start' : 'flex-end',
+      }}
+    >
+      <Group 
+        align="flex-start" 
+        style={{ 
+          backgroundColor: isBot ? 'var(--message-bot-bg)' : undefined,
+          borderRadius: '8px',
+          gap: isBot ? '1rem' : '0.5rem',
+          flexDirection: isBot ? 'row' : 'row-reverse',
+        }}
       >
-        {message.isBot && (
-          <ActionIcon
-            variant="subtle"
-            color="blue"
-            size="lg"
-            radius="xl"
-            style={{ backgroundColor: 'var(--icon-bg)' }}
-          >
-            <IconRobot style={{ width: 'calc(1.2rem * var(--mantine-scale))', height: 'calc(1.2rem * var(--mantine-scale))' }} />
-          </ActionIcon>
-        )}
-
-        <Paper
-          p="sm"
-          radius="md"
-          style={{
-            backgroundColor: message.isBot ? 'var(--message-bot-bg)' : 'var(--mantine-color-blue-filled)',
-            maxWidth: selectedCitation ? '50%' : '70%',
-            boxShadow: '0 2px 4px rgba(0,0,0,0.1)',
-          }}
-        >
-          {message.isBot ? (
-            <ReactMarkdown
-              components={createMarkdownComponents({
-                message,
-                onCitationClick: setSelectedCitation,
-              })}
-              className="markdown-content"
-              remarkPlugins={[]}
-              rehypePlugins={[]}
-            >
-              {message.text}
-            </ReactMarkdown>
-          ) : (
-            <Text 
-              size="sm" 
+        {/* Avatar */}
+        <div style={{
+          width: '2.5rem',
+          height: '2.5rem',
+          borderRadius: '50%',
+          backgroundColor: isBot ? 'var(--icon-bg)' : 'var(--message-user-bg)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          flexShrink: 0,
+        }}>
+          {isBot ? (
+            <IconRobot 
               style={{ 
-                whiteSpace: 'pre-wrap', 
-                lineHeight: 1.5,
+                width: 'calc(1.5rem * var(--mantine-scale))', 
+                height: 'calc(1.5rem * var(--mantine-scale))',
+                color: 'var(--mantine-color-blue-filled)',
+              }} 
+            />
+          ) : (
+            <IconUser 
+              style={{ 
+                width: 'calc(1.5rem * var(--mantine-scale))', 
+                height: 'calc(1.5rem * var(--mantine-scale))',
                 color: 'white',
-              }}
-            >
-              {message.text}
-            </Text>
+              }} 
+            />
           )}
-          <Text 
-            size="xs" 
-            style={{ 
-              opacity: 0.7, 
-              textAlign: 'right',
-              marginTop: '4px',
-              color: message.isBot ? 'var(--text-secondary)' : 'var(--mantine-color-white-alpha-70)',
-            }}
-          >
-            {message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-          </Text>
-        </Paper>
+        </div>
 
-        {!message.isBot && (
-          <ActionIcon
-            variant="subtle"
-            color="blue"
-            size="lg"
-            radius="xl"
-            style={{ backgroundColor: 'var(--icon-bg)' }}
-          >
-            <IconUser style={{ width: 'calc(1.2rem * var(--mantine-scale))', height: 'calc(1.2rem * var(--mantine-scale))' }} />
-          </ActionIcon>
-        )}
+        {/* Message Content */}
+        <Paper 
+          shadow="sm"
+          p="lg" 
+          style={{ 
+            flex: 1,
+            backgroundColor: isBot ? 'var(--container-bg)' : 'var(--message-user-bg)',
+            color: isBot ? 'var(--text-bright)' : 'white',
+            border: isBot ? '1px solid var(--border-color)' : 'none',
+          }}
+          radius="md"
+        >
+          <MessageContent message={message} />
+        </Paper>
       </Group>
 
-      {selectedCitation && (
-        <CitationSidebar citation={selectedCitation} />
-      )}
-    </Group>
+      {/* Timestamp */}
+      <Text 
+        size="xs" 
+        c="dimmed"
+        style={{
+          marginLeft: isBot ? '3.5rem' : '0',
+          marginRight: isBot ? '0' : '3.5rem',
+        }}
+      >
+        {message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+      </Text>
+    </Stack>
   );
 } 
+--------------------------------------------------------------------------------
+<File: frontend/src/components2/chat/ui/MessageContent.tsx>
+// ----------------------------------------------------
+// File: frontend/src/components2/chat/ui/MessageContent.tsx
+// ----------------------------------------------------
+import { useMemo } from 'react';
+import { Box, Divider, Text, List } from '@mantine/core';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import { Message } from '../types';
+import { CodeProps } from 'react-markdown/lib/ast-to-react';
+
+/**
+ * Finds a "References:" line plus a [REFERENCES: {...}] JSON block at the end
+ * of the text, and separates it out. Returns:
+ *   - answer: text before the references
+ *   - referencesRaw: the raw "[REFERENCES: { ... }]" string (if found)
+ */
+function parseReferences(text: string): { answer: string; referencesRaw: string } {
+  // Regex looks for:
+  //   "References:" plus optional whitespace, then
+  //   the [REFERENCES: {...}] block at the very end of the message
+  const pattern = /References:\s*(?<block>\[REFERENCES:\s*\{[\s\S]*?\}\])\s*$/i;
+  const match = text.match(pattern);
+
+  if (!match?.groups?.block) {
+    return { answer: text.trim(), referencesRaw: '' };
+  }
+
+  // The raw references block: "[REFERENCES: {...}]"
+  const referencesRaw = match.groups.block.trim();
+  // The answer is everything up to the start of the references block
+  const answer = text.slice(0, match.index).trim();
+
+  return { answer, referencesRaw };
+}
+
+/**
+ * Given a raw references string like "[REFERENCES: { "files": ["doc1.pdf"] }]",
+ * parse out the JSON inside of it, and return the file list with citation numbers.
+ * If parsing fails, we return an empty array.
+ */
+function extractFilesFromReferences(raw: string): Array<{number: number; file: string}> {
+  // Look for the JSON between [REFERENCES: and the final ]
+  const jsonPattern = /\[REFERENCES:\s*(\{.*\})\]/s;
+  const jsonMatch = raw.match(jsonPattern);
+  if (!jsonMatch) return [];
+
+  try {
+    const obj = JSON.parse(jsonMatch[1]);
+    const files = obj.files || [];
+    if (Array.isArray(files)) {
+      return files.map((file, index) => ({
+        number: index + 1,
+        file
+      }));
+    }
+    return [];
+  } catch (err) {
+    console.error('Failed to parse references JSON:', err);
+    return [];
+  }
+}
+
+interface MessageContentProps {
+  message: Message;
+}
+
+export function MessageContent({ message }: MessageContentProps) {
+  // Avoid undefined text
+  const rawText = message.text ?? '';
+
+  // Split out the references from the text
+  const { answer, referencesRaw } = useMemo(
+    () => parseReferences(rawText),
+    [rawText]
+  );
+
+  // Parse the [REFERENCES: ... ] block to get the list of files
+  const files = useMemo(() => extractFilesFromReferences(referencesRaw), [referencesRaw]);
+
+  // Common code-block renderer for ReactMarkdown
+  const codeRenderer = ({
+    inline,
+    className,
+    children,
+    ...props
+  }: CodeProps) => {
+    const match = /language-(\w+)/.exec(className || '');
+    if (!inline && match) {
+      return (
+        <SyntaxHighlighter
+          style={oneDark as any}
+          language={match[1]}
+          PreTag="div"
+          showLineNumbers
+          {...props}
+        >
+          {String(children).replace(/\n$/, '')}
+        </SyntaxHighlighter>
+      );
+    }
+    return (
+      <code className={className} {...props}>
+        {children}
+      </code>
+    );
+  };
+
+  return (
+    <Box
+      style={{
+        whiteSpace: 'pre-wrap',
+        lineHeight: 1.6,
+      }}
+    >
+      {/* Main answer content */}
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ code: codeRenderer }}>
+        {answer}
+      </ReactMarkdown>
+
+      {/* Only show "References" if we found a references block */}
+      {referencesRaw && files.length > 0 && (
+        <>
+          <Divider my="md" variant="dashed" />
+          <Text fw="bold" mb="xs">
+            References
+          </Text>
+          <List size="sm" spacing="xs" listStyleType="none" ml={0}>
+            {files.map(({number, file}) => (
+              <List.Item key={number}>[{number}] {file}</List.Item>
+            ))}
+          </List>
+        </>
+      )}
+    </Box>
+  );
+}
+
 --------------------------------------------------------------------------------
 <File: frontend/src/index.css>
 @import '@mantine/core/styles.css';
 
 :root {
   /* Base colors */
-  --app-bg: #1A1B1E;
-  --container-bg: #25262B;
-  --header-bg: #2C2E33;
-  --chat-bg: #1F2023;
-  --input-bg: #25262B;
-  --border-color: #2C2E33;
+  --app-bg: #f8f9fa;
+  --container-bg: #ffffff;
+  --header-bg: #f1f3f5;
+  --chat-bg: #f8f9fa;
+  --input-bg: #ffffff;
+  --border-color: #e9ecef;
   
   /* Message colors */
-  --message-bot-bg: #2C2E33;
+  --message-bot-bg: #f8f9fa;
   --message-user-bg: #228BE6;
   --icon-bg: rgba(76, 110, 245, 0.1);
   
   /* Text colors */
-  --text-bright: #FFFFFF;
+  --text-bright: #1a1b1e;
   --text-primary: #C1C2C5;
-  --text-secondary: #909296;
+  --text-secondary: #868e96;
 
   /* Input colors */
   --input-text: #FFFFFF;
@@ -1071,6 +980,19 @@ input::placeholder {
   30% {
     transform: translateY(-4px);
   }
+}
+
+/* Dark theme overrides */
+[data-mantine-color-scheme="dark"] {
+  --app-bg: #1a1b1e;
+  --container-bg: #25262b;
+  --border-color: #373a40;
+  --text-bright: #ffffff;
+  --text-secondary: #909296;
+  --header-bg: #25262b;
+  --chat-bg: #1a1b1e;
+  --input-bg: #25262b;
+  --message-bot-bg: #25262b;
 }
 
 --------------------------------------------------------------------------------
@@ -1158,7 +1080,155 @@ createRoot(document.getElementById('root')!).render(
 
 --------------------------------------------------------------------------------
 <File: README.md>
-# simple_rag_chatbot
+# Simple RAG Chatbot
+
+A modern, responsive chatbot application that uses Retrieval-Augmented Generation (RAG) to provide accurate, context-aware responses based on your PDF documents. Built with Google's Gemini AI, ChromaDB, and a React + Flask stack.
+
+![Application Screenshot](images/main_ui.png)
+
+
+## Features
+
+- 📄 PDF Document Processing: Upload and process PDF documents for contextual information
+- 🔍 Smart Retrieval: Uses ChromaDB vector store for efficient semantic search
+- 🤖 Advanced AI Responses: Powered by Google's Gemini AI model
+- 💬 Real-time Chat Interface: Modern React-based UI with streaming responses
+- 📚 Source Citations: Automatic citation of sources with page numbers
+- 🎯 Context-Aware: Responses are based on your document content
+
+## Architecture
+
+### Backend Components
+
+- **Flask Server**: REST API handling document processing and chat endpoints
+- **Document Processor**: Manages PDF processing and vector storage
+- **Gemini AI**: Google's latest LLM for generating responses
+- **ChromaDB**: Vector database for efficient semantic search
+- **LangChain**: Framework for connecting various components
+
+### Frontend Components
+
+- **React + TypeScript**: Modern frontend framework
+- **Real-time Updates**: Server-Sent Events for streaming responses
+- **Responsive Design**: Modern UI that works on all devices
+
+## Setup Instructions
+
+### Prerequisites
+
+- Python 3.8+
+- Node.js 16+
+- Google Cloud API key with Gemini API access
+- C++ Build Tools (Required for some Python packages)
+  - **Windows**: Install "Desktop development with C++" workload from Visual Studio Build Tools
+  - **Linux**: `sudo apt-get install build-essential`
+  - **macOS**: Install Xcode Command Line Tools: `xcode-select --install`
+
+### Backend Setup
+
+1. Create a Python virtual environment:
+   
+   **Command Line:**
+   ```bash
+   python -m venv .venv
+   ```
+   
+   **VS Code:**
+   - Press `Ctrl+Shift+P` (Windows) or `Cmd+Shift+P` (Mac)
+   - Type "Python: Create Environment"
+   - Select "Venv"
+   - Choose your Python interpreter
+
+2. Activate the virtual environment:
+   - Windows:
+     ```powershell
+     .\.venv\Scripts\activate
+     ```
+   - Unix/MacOS:
+     ```bash
+     source .venv/bin/activate
+     ```
+
+3. Install Python dependencies:
+   ```bash
+   cd backend
+   pip install -r requirements.txt
+   ```
+
+4. Create a `.env` file in the backend directory (or rename example.env to .env and fill in your API key):
+   ```
+   GOOGLE_API_KEY=your_google_api_key_here
+   ```
+
+### Frontend Setup
+
+1. Install Node.js dependencies and build the application:
+   ```bash
+   cd frontend
+   npm install
+   npm run build
+   ```
+
+### Data Setup
+
+1. Create a data directory structure:
+   ```
+   data/
+   ├── source_files/    # Place your PDF files here
+   └── vector_db/       # Will store the vector embeddings
+   ```
+
+2. Place your PDF documents in the `data/source_files` directory
+
+3. Index your documents:
+   ```bash
+   cd backend
+   python document_processor.py
+   ```
+
+### Running the Application
+
+1. Start the application using the provided script:
+   ```bash
+   cd backend
+   ./start.ps1
+   ```
+   This script will handle both the backend server startup and serve the built frontend.
+
+2. Open your browser and navigate to `http://localhost:5000`
+
+## Usage
+
+1. Place your PDF documents in the `data/source_files` directory
+2. Process the documents using the UI or API endpoint
+3. Start chatting! Ask questions about your documents
+4. The system will provide responses with citations to specific pages in your documents
+
+## Project Structure
+
+```
+.
+├── backend/
+│   ├── app.py                 # Main Flask application
+│   ├── document_processor.py  # PDF processing and vector storage
+│   └── requirements.txt       # Python dependencies
+├── frontend/
+│   ├── src/
+│   │   ├── components/       # React components
+│   │   └── App.tsx          # Main React application
+│   └── package.json         # Node.js dependencies
+└── data/
+    ├── source_files/        # PDF documents
+    └── vector_db/          # ChromaDB storage
+```
+
+## Contributing
+
+Feel free to submit issues and enhancement requests!
+
+## License
+
+[Add your chosen license here]
 --------------------------------------------------------------------------------
 
 <end codebase> 
